@@ -6,29 +6,29 @@ What it does:
 - Ingests UPI transaction history (CSV upload or bundled demo data)
 - Categorizes spend, builds a dashboard (category split, monthly trend)
 - Runs a rule + LLM-assisted anomaly/fraud scanner over transactions
-- Exposes a chat agent (Claude + tool use) that can answer natural-language
-  questions about the user's money by calling real tools over the data,
-  not by guessing from a prompt.
+- Exposes a chat agent (Gemini + function calling) that can answer
+  natural-language questions about the user's money by calling real tools
+  over the data, not by guessing from a prompt.
 
 Run:
-    export ANTHROPIC_API_KEY=sk-ant-...
+    export GEMINI_API_KEY=AIza...      # free key from aistudio.google.com/apikey
     pip install -r requirements.txt
     streamlit run app.py
 """
 
 import os
-import json
 import datetime as dt
 
 import pandas as pd
 import streamlit as st
 import plotly.express as px
-from anthropic import Anthropic
+from google import genai
+from google.genai import types
 
 # ----------------------------------------------------------------------------
 # Config
 # ----------------------------------------------------------------------------
-MODEL = "claude-sonnet-4-6"
+GEMINI_MODEL = "gemini-2.5-flash"  # free-tier eligible, function-calling capable
 st.set_page_config(page_title="PaisaPilot - UPI Finance Agent", page_icon="💸", layout="wide")
 
 CATEGORIES = [
@@ -57,7 +57,7 @@ def load_uploaded(file) -> pd.DataFrame:
 # ----------------------------------------------------------------------------
 # Agent "tools" - these are real Python functions the LLM can call.
 # This is what makes PaisaPilot an agent rather than a single prompt:
-# Claude decides *which* tool to call and with *what arguments* based on
+# Gemini decides *which* tool to call and with *what arguments* based on
 # the user's natural-language question, we execute it against the actual
 # dataframe, and feed the structured result back for a grounded answer.
 # ----------------------------------------------------------------------------
@@ -140,46 +140,6 @@ def tool_savings_recommendation(df):
     }
 
 
-TOOLS = [
-    {
-        "name": "get_total_spend",
-        "description": "Get total spend/income and transaction count, optionally filtered by date range or category.",
-        "input_schema": {
-            "type": "object",
-            "properties": {
-                "start_date": {"type": "string", "description": "YYYY-MM-DD"},
-                "end_date": {"type": "string", "description": "YYYY-MM-DD"},
-                "category": {"type": "string", "description": "One of the known spend categories"},
-            },
-        },
-    },
-    {
-        "name": "get_category_breakdown",
-        "description": "Get spend broken down by category, optionally for a specific month (YYYY-MM).",
-        "input_schema": {
-            "type": "object",
-            "properties": {"month": {"type": "string", "description": "YYYY-MM, optional"}},
-        },
-    },
-    {
-        "name": "flag_anomalies",
-        "description": "Scan all transactions for suspicious/anomalous activity, including patterns that match common UPI scams.",
-        "input_schema": {"type": "object", "properties": {}},
-    },
-    {
-        "name": "get_savings_recommendation",
-        "description": "Get average monthly income, spend and savings rate to ground a savings recommendation.",
-        "input_schema": {"type": "object", "properties": {}},
-    },
-]
-
-TOOL_IMPL = {
-    "get_total_spend": tool_total_spend,
-    "get_category_breakdown": tool_category_breakdown,
-    "flag_anomalies": tool_flag_anomalies,
-    "get_savings_recommendation": tool_savings_recommendation,
-}
-
 SYSTEM_PROMPT = """You are PaisaPilot, an autonomous personal finance agent for
 Indian UPI users. You have tools to query the user's real transaction data -
 always call a tool to get numbers before answering; never guess or invent
@@ -191,111 +151,401 @@ relevant to fraud). Keep answers under 150 words unless the user asks for
 detail."""
 
 
-def run_agent(client, df, user_message, history):
-    messages = history + [{"role": "user", "content": user_message}]
+def make_gemini_tools(df):
+    """Build the tool set Gemini can call, closed over the live dataframe.
 
-    while True:
-        resp = client.messages.create(
-            model=MODEL,
-            max_tokens=1000,
-            system=SYSTEM_PROMPT,
-            tools=TOOLS,
-            messages=messages,
-        )
+    The Gen AI SDK supports "automatic function calling": pass real Python
+    functions (with type hints + docstrings) as tools, and the SDK inspects
+    their signature to build the schema, decides when to call them, executes
+    them, and feeds the result back to the model — the same plan -> act ->
+    observe -> respond loop as manual tool use, just handled by the SDK.
+    Each wrapper below takes no `df` argument (the model shouldn't supply
+    that) and instead closes over the currently loaded dataframe.
+    """
 
-        if resp.stop_reason != "tool_use":
-            final_text = "".join(b.text for b in resp.content if b.type == "text")
-            messages.append({"role": "assistant", "content": resp.content})
-            return final_text, messages
+    def get_total_spend(start_date: str = "", end_date: str = "", category: str = "") -> dict:
+        """Get total spend/income and transaction count, optionally filtered by date range or category.
 
-        messages.append({"role": "assistant", "content": resp.content})
-        tool_results = []
-        for block in resp.content:
-            if block.type != "tool_use":
-                continue
-            fn = TOOL_IMPL[block.name]
-            try:
-                result = fn(df, **block.input)
-            except Exception as e:
-                result = {"error": str(e)}
-            tool_results.append({
-                "type": "tool_result",
-                "tool_use_id": block.id,
-                "content": json.dumps(result),
-            })
-        messages.append({"role": "user", "content": tool_results})
+        Args:
+            start_date: Filter start date in YYYY-MM-DD format. Leave empty for no filter.
+            end_date: Filter end date in YYYY-MM-DD format. Leave empty for no filter.
+            category: One of the known spend categories. Leave empty for no filter.
+        """
+        return tool_total_spend(df, start_date or None, end_date or None, category or None)
 
+    def get_category_breakdown(month: str = "") -> dict:
+        """Get spend broken down by category, optionally for one month.
+
+        Args:
+            month: Month in YYYY-MM format. Leave empty to cover all months.
+        """
+        return tool_category_breakdown(df, month or None)
+
+    def flag_anomalies() -> list:
+        """Scan all transactions for suspicious/anomalous activity, including
+        patterns that match common UPI scams (e.g. rapid small-then-large
+        transfers to the same payee, or spend far above a category average).
+        """
+        return tool_flag_anomalies(df)
+
+    def get_savings_recommendation() -> dict:
+        """Get average monthly income, spend and savings rate to ground a savings recommendation."""
+        return tool_savings_recommendation(df)
+
+    return [get_total_spend, get_category_breakdown, flag_anomalies, get_savings_recommendation]
+
+
+def run_agent(client, df, user_message, chat):
+    """Send a message through the Gemini agent.
+
+    `chat` is a persistent `client.chats.create(...)` session (created once
+    per Streamlit session in `st.session_state`) so conversational memory
+    and tool-call context carry across turns without us re-serializing
+    history by hand.
+    """
+    resp = chat.send_message(user_message)
+    return resp.text, chat
+
+
+# ----------------------------------------------------------------------------
+# Theme — "Passbook Ledger"
+# Grounded in the Indian bank-passbook / accounts-ledger aesthetic: kraft
+# paper, indigo fountain-pen ink for entries, a red ledger margin rule down
+# the page, dot-matrix monospace for figures, and rubber-stamp badges for
+# flagged (fraud-pattern) entries — the same visual language as a physical
+# passbook a bank teller stamps, applied to an autonomous agent instead.
+# ----------------------------------------------------------------------------
+PAPER = "#EDE3C8"
+PAPER_ALT = "#E3D6AE"
+PAPER_DARK = "#DCCE9F"
+INK = "#1D2A5E"
+INK_LIGHT = "#3B4E96"
+STAMP_RED = "#A8362A"
+STAMP_GREEN = "#2E6B4E"
+RULE = "#B9A876"
+TEXT = "#241F14"
+TEXT_MUTED = "#5B4F36"
+
+THEME_CSS = f"""
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Space+Mono:wght@400;700&family=Inter:wght@400;500;600&display=swap');
+
+html, body, [class*="css"] {{ font-family: 'Inter', sans-serif; }}
+
+.stApp {{
+    background-color: {PAPER};
+    background-image:
+        repeating-linear-gradient(#EDE3C8 0px, #EDE3C8 27px, {RULE}55 28px),
+        linear-gradient(90deg, transparent 0px, transparent 78px, {STAMP_RED}55 79px, {STAMP_RED}55 80px, transparent 81px);
+    background-attachment: local, fixed;
+    color: {TEXT};
+}}
+
+section[data-testid="stSidebar"] {{
+    background-color: {PAPER_DARK};
+    border-right: 2px solid {RULE};
+}}
+section[data-testid="stSidebar"] * {{ color: {TEXT}; }}
+
+/* Passbook cover header */
+.passbook-cover {{
+    background: {INK};
+    color: {PAPER};
+    border-radius: 4px;
+    padding: 28px 36px 24px 96px;
+    position: relative;
+    margin-bottom: 18px;
+    box-shadow: 0 4px 0 {RULE}, 0 4px 14px rgba(0,0,0,0.25);
+}}
+.passbook-cover::before {{
+    content: "";
+    position: absolute;
+    left: 0; top: 0; bottom: 0; width: 68px;
+    background-image: radial-gradient({PAPER} 3px, transparent 4px);
+    background-size: 100% 22px;
+    background-position: 34px 12px;
+    border-right: 2px dashed {PAPER}66;
+}}
+.passbook-eyebrow {{
+    font-family: 'Space Mono', monospace;
+    font-size: 12px;
+    letter-spacing: 2px;
+    text-transform: uppercase;
+    color: #E8B84B;
+    margin-bottom: 6px;
+}}
+.passbook-title {{
+    font-family: 'Space Mono', monospace;
+    font-weight: 700;
+    font-size: 42px;
+    letter-spacing: 1px;
+    margin: 0;
+}}
+.passbook-sub {{
+    font-size: 15px;
+    color: {PAPER}CC;
+    margin-top: 6px;
+    max-width: 640px;
+}}
+
+/* Ledger stat cards */
+.ledger-row {{ display: flex; gap: 14px; margin-bottom: 6px; }}
+.ledger-card {{
+    flex: 1;
+    background: {PAPER_DARK};
+    border: 1px solid {RULE};
+    border-left: 4px solid {INK};
+    border-radius: 3px;
+    padding: 14px 18px;
+}}
+.ledger-card.credit {{ border-left-color: {STAMP_GREEN}; }}
+.ledger-card.debit {{ border-left-color: {STAMP_RED}; }}
+.ledger-label {{
+    font-family: 'Space Mono', monospace;
+    font-size: 11px;
+    letter-spacing: 1.5px;
+    text-transform: uppercase;
+    color: {TEXT_MUTED};
+}}
+.ledger-value {{
+    font-family: 'Space Mono', monospace;
+    font-size: 26px;
+    font-weight: 700;
+    color: {INK};
+    margin-top: 2px;
+}}
+
+/* Section labels look like ledger column headers */
+.ledger-heading {{
+    font-family: 'Space Mono', monospace;
+    font-size: 13px;
+    letter-spacing: 2px;
+    text-transform: uppercase;
+    color: {TEXT_MUTED};
+    border-bottom: 1px solid {RULE};
+    padding-bottom: 6px;
+    margin: 22px 0 10px 0;
+}}
+
+/* Rubber-stamp anomaly badges */
+.stamp-card {{
+    display: flex;
+    align-items: center;
+    gap: 16px;
+    background: {PAPER_DARK};
+    border: 1px solid {RULE};
+    border-radius: 3px;
+    padding: 12px 16px;
+    margin-bottom: 10px;
+}}
+.stamp-badge {{
+    font-family: 'Space Mono', monospace;
+    font-weight: 700;
+    font-size: 11px;
+    letter-spacing: 1px;
+    color: {STAMP_RED};
+    border: 2px solid {STAMP_RED};
+    border-radius: 50%;
+    width: 74px; height: 74px;
+    min-width: 74px;
+    display: flex; align-items: center; justify-content: center;
+    text-align: center;
+    transform: rotate(-8deg);
+    line-height: 1.1;
+    opacity: 0.85;
+}}
+.stamp-body b {{ font-family: 'Space Mono', monospace; color: {INK}; }}
+.stamp-body span {{ color: {TEXT_MUTED}; font-size: 13px; }}
+
+.clear-card {{
+    background: {PAPER_DARK};
+    border: 1px solid {STAMP_GREEN};
+    border-left: 4px solid {STAMP_GREEN};
+    border-radius: 3px;
+    padding: 14px 18px;
+    color: {TEXT};
+}}
+
+.helpline-note {{
+    font-family: 'Space Mono', monospace;
+    font-size: 12.5px;
+    background: {INK};
+    color: {PAPER};
+    border-radius: 3px;
+    padding: 12px 16px;
+    margin-top: 8px;
+}}
+
+/* Tabs styled like passbook page dividers */
+.stTabs [data-baseweb="tab-list"] {{ gap: 4px; border-bottom: 2px solid {RULE}; }}
+.stTabs [data-baseweb="tab"] {{
+    font-family: 'Space Mono', monospace;
+    font-size: 13px;
+    letter-spacing: 0.5px;
+    background-color: {PAPER_DARK};
+    border-radius: 4px 4px 0 0;
+    padding: 8px 18px;
+    color: {TEXT_MUTED};
+}}
+.stTabs [aria-selected="true"] {{
+    background-color: {INK} !important;
+    color: {PAPER} !important;
+}}
+
+/* Buttons / inputs */
+.stButton>button, .stDownloadButton>button {{
+    font-family: 'Space Mono', monospace;
+    background-color: {INK};
+    color: {PAPER};
+    border: none;
+    border-radius: 3px;
+}}
+div[data-testid="stChatInput"] textarea {{
+    font-family: 'Inter', sans-serif;
+}}
+
+/* Dataframe container */
+div[data-testid="stDataFrame"] {{
+    border: 1px solid {RULE};
+    border-radius: 3px;
+}}
+</style>
+"""
+
+st.markdown(THEME_CSS, unsafe_allow_html=True)
+
+PLOTLY_TEMPLATE = dict(
+    layout=dict(
+        paper_bgcolor=PAPER_DARK,
+        plot_bgcolor=PAPER_DARK,
+        font=dict(family="Space Mono, monospace", color=TEXT, size=12),
+        colorway=[INK, STAMP_RED, STAMP_GREEN, INK_LIGHT, "#8A6D3B", "#6E4B3A",
+                  "#4B6E5E", "#B98B3E", "#7A4B6E", "#3E6E8A"],
+        title_font=dict(family="Space Mono, monospace", size=14, color=TEXT),
+        legend=dict(font=dict(size=11)),
+    )
+)
 
 # ----------------------------------------------------------------------------
 # UI
 # ----------------------------------------------------------------------------
-st.title("💸 PaisaPilot — Your Autonomous UPI Finance Agent")
-st.caption("Track: Agents for Business · AI Agents Intensive Vibe Coding Capstone")
+st.markdown(
+    """
+    <div class="passbook-cover">
+        <div class="passbook-eyebrow">Account Book · Autonomous Agent Edition</div>
+        <p class="passbook-title">💸 PaisaPilot</p>
+        <p class="passbook-sub">Your UPI transactions, read and watched by an agent that
+        answers questions with real numbers and stamps entries that look like fraud —
+        Track: Agents for Business · AI Agents Intensive Vibe Coding Capstone</p>
+    </div>
+    """,
+    unsafe_allow_html=True,
+)
 
 with st.sidebar:
-    st.header("Setup")
-    api_key = st.text_input("Anthropic API key", type="password",
-                             value=os.environ.get("ANTHROPIC_API_KEY", ""))
-    st.markdown("---")
-    data_source = st.radio("Data source", ["Use demo data", "Upload my UPI CSV"])
+    st.markdown("<div class='ledger-heading'>Teller Setup</div>", unsafe_allow_html=True)
+    api_key = st.text_input("Gemini API key", type="password",
+                             value=os.environ.get("GEMINI_API_KEY", ""))
+    st.caption(
+        "Free — no credit card. Get one at "
+        "[aistudio.google.com/apikey](https://aistudio.google.com/apikey)."
+    )
+    st.markdown("<div class='ledger-heading'>Data Source</div>", unsafe_allow_html=True)
+    data_source = st.radio("Data source", ["Use demo data", "Upload my UPI CSV"], label_visibility="collapsed")
     uploaded = None
     if data_source == "Upload my UPI CSV":
         uploaded = st.file_uploader("CSV with columns: date, payee, category, amount", type="csv")
-    st.markdown("---")
+    st.markdown("<div class='ledger-heading'>Why This Ledger Exists</div>", unsafe_allow_html=True)
     st.markdown(
-        "**Why this exists:** UPI users in India lose money every week to "
-        "task/OTP/small-test-transfer scams, and nobody has a simple way to "
-        "see spend patterns across apps (GPay, PhonePe, Paytm...). "
-        "PaisaPilot is a single agent that unifies the view and actively "
-        "watches for fraud patterns, not just totals."
+        "UPI users in India lose money every week to task/OTP/small-test-transfer "
+        "scams, and nobody has a simple way to see spend patterns across apps "
+        "(GPay, PhonePe, Paytm...). PaisaPilot is a single agent that unifies "
+        "the view and actively watches for fraud patterns, not just totals."
     )
 
 df = load_uploaded(uploaded) if uploaded is not None else load_demo_data()
 
-tab1, tab2, tab3 = st.tabs(["📊 Dashboard", "🚨 Anomaly Scan", "🤖 Ask PaisaPilot"])
+tab1, tab2, tab3 = st.tabs(["📊 Ledger Summary", "🔏 Stamped Entries (Anomalies)", "🤖 Ask The Teller"])
 
 with tab1:
-    col1, col2, col3 = st.columns(3)
     summary = tool_total_spend(df)
-    col1.metric("Total spend", f"₹{summary['total_spend']:,.0f}")
-    col2.metric("Total income", f"₹{summary['total_income']:,.0f}")
-    col3.metric("Transactions", summary["transaction_count"])
+    st.markdown(
+        f"""
+        <div class="ledger-row">
+            <div class="ledger-card debit">
+                <div class="ledger-label">Total Debit</div>
+                <div class="ledger-value">₹{summary['total_spend']:,.0f}</div>
+            </div>
+            <div class="ledger-card credit">
+                <div class="ledger-label">Total Credit</div>
+                <div class="ledger-value">₹{summary['total_income']:,.0f}</div>
+            </div>
+            <div class="ledger-card">
+                <div class="ledger-label">Entries</div>
+                <div class="ledger-value">{summary['transaction_count']}</div>
+            </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
     breakdown = tool_category_breakdown(df)
+    st.markdown("<div class='ledger-heading'>Spend Split &amp; Monthly Trend</div>", unsafe_allow_html=True)
     c1, c2 = st.columns(2)
     with c1:
-        fig = px.pie(names=list(breakdown.keys()), values=list(breakdown.values()),
-                      title="Spend by category")
+        fig = px.pie(names=list(breakdown.keys()), values=list(breakdown.values()))
+        fig.update_layout(**PLOTLY_TEMPLATE["layout"])
+        fig.update_traces(marker=dict(line=dict(color=PAPER, width=1.5)))
         st.plotly_chart(fig, use_container_width=True)
     with c2:
         monthly = df.copy()
         monthly["month"] = monthly["date"].dt.strftime("%Y-%m")
         spend_by_month = monthly[monthly["amount"] < 0].groupby("month")["amount"].sum().abs()
         fig2 = px.bar(x=spend_by_month.index, y=spend_by_month.values,
-                       labels={"x": "Month", "y": "Spend (₹)"}, title="Monthly spend trend")
+                       labels={"x": "Month", "y": "Spend (₹)"})
+        fig2.update_traces(marker_color=INK)
+        fig2.update_layout(**PLOTLY_TEMPLATE["layout"])
         st.plotly_chart(fig2, use_container_width=True)
 
+    st.markdown("<div class='ledger-heading'>Raw Ledger Entries</div>", unsafe_allow_html=True)
     st.dataframe(df.sort_values("date", ascending=False), use_container_width=True)
 
 with tab2:
-    st.subheader("Anomaly & fraud-pattern scan")
+    st.markdown("<div class='ledger-heading'>Fraud-Pattern &amp; Anomaly Scan</div>", unsafe_allow_html=True)
     flags = tool_flag_anomalies(df)
     if not flags:
-        st.success("No suspicious patterns found in this data.")
+        st.markdown(
+            "<div class='clear-card'><b>✓ CLEAR</b> — No suspicious patterns found in this data.</div>",
+            unsafe_allow_html=True,
+        )
     else:
         for f in flags:
-            st.warning(f"**{f['date']} · {f['payee']} · ₹{abs(f['amount']):,.0f}**\n\n{f['reason']}")
-        st.info(
-            "If any of these are real and unauthorized, report immediately at "
-            "cybercrime.gov.in or call the national cyber helpline **1930**."
+            st.markdown(
+                f"""
+                <div class="stamp-card">
+                    <div class="stamp-badge">⚠<br/>FLAGGED</div>
+                    <div class="stamp-body">
+                        <b>{f['date']} · {f['payee']} · ₹{abs(f['amount']):,.0f}</b><br/>
+                        <span>{f['reason']}</span>
+                    </div>
+                </div>
+                """,
+                unsafe_allow_html=True,
+            )
+        st.markdown(
+            "<div class='helpline-note'>⚠ If any of these are real and unauthorized, "
+            "report immediately at cybercrime.gov.in or call the national cyber "
+            "helpline <b>1930</b>.</div>",
+            unsafe_allow_html=True,
         )
 
 with tab3:
-    st.subheader("Chat with your finance agent")
-    if "chat_history" not in st.session_state:
-        st.session_state.chat_history = []
+    st.markdown("<div class='ledger-heading'>Chat With Your Finance Agent</div>", unsafe_allow_html=True)
     if "display_history" not in st.session_state:
         st.session_state.display_history = []
+    if "gemini_chat" not in st.session_state:
+        st.session_state.gemini_chat = None
+        st.session_state.gemini_chat_signature = None
 
     for role, text in st.session_state.display_history:
         with st.chat_message(role):
@@ -304,14 +554,31 @@ with tab3:
     q = st.chat_input("e.g. How much did I spend on food last month? Any scam signs this month?")
     if q:
         if not api_key:
-            st.error("Add your Anthropic API key in the sidebar first.")
+            st.error("Add your Gemini API key in the sidebar first (it's free — see the link above).")
         else:
             with st.chat_message("user"):
                 st.markdown(q)
-            client = Anthropic(api_key=api_key)
+
+            # Recreate the chat session if the API key or loaded data changed,
+            # so the tools always close over the current dataframe.
+            signature = (api_key, id(df))
+            if st.session_state.gemini_chat_signature != signature:
+                client = genai.Client(api_key=api_key)
+                st.session_state.gemini_chat = client.chats.create(
+                    model=GEMINI_MODEL,
+                    config=types.GenerateContentConfig(
+                        system_instruction=SYSTEM_PROMPT,
+                        tools=make_gemini_tools(df),
+                    ),
+                )
+                st.session_state.gemini_chat_signature = signature
+
             with st.spinner("PaisaPilot is checking your transactions..."):
-                answer, new_history = run_agent(client, df, q, st.session_state.chat_history)
-            st.session_state.chat_history = new_history
+                try:
+                    answer, _ = run_agent(None, df, q, st.session_state.gemini_chat)
+                except Exception as e:
+                    answer = f"Something went wrong talking to Gemini: {e}"
+
             st.session_state.display_history.append(("user", q))
             st.session_state.display_history.append(("assistant", answer))
             with st.chat_message("assistant"):
