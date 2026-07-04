@@ -56,45 +56,6 @@ To use it with your own data, export any UPI/bank statement to CSV with
 columns: `date, payee, category, amount` (negative = spend, positive =
 income) and upload it from the sidebar.
 
-## Deploying a public demo (Streamlit Community Cloud — free)
-
-**Step 1 — Push this folder to GitHub**
-```bash
-cd paisapilot
-git init
-git add .
-git commit -m "PaisaPilot - UPI finance agent"
-git branch -M main
-git remote add origin https://github.com/<your-username>/paisapilot.git
-git push -u origin main
-```
-(Create the empty repo on GitHub first at github.com/new — public, no
-README/license, so it doesn't conflict with the push above.)
-
-**Step 2 — Create the account / connect GitHub**
-1. Go to [share.streamlit.io](https://share.streamlit.io)
-2. Sign in with your GitHub account and authorize Streamlit to access your
-   repos (you can restrict it to just this repo if you prefer)
-
-**Step 3 — Deploy**
-1. In your workspace, click **"Create app"** (top right)
-2. Choose **"Yup, I have an app"**
-3. Fill in: Repository = `<your-username>/paisapilot`, Branch = `main`,
-   Main file path = `app.py`
-4. Optional: set a custom subdomain under "App URL" (e.g.
-   `paisapilot.streamlit.app`)
-5. Click **"Advanced settings"** → paste this into the **Secrets** box:
-   ```toml
-   GEMINI_API_KEY = "AIza...your-free-key-from-aistudio.google.com/apikey"
-   ```
-6. Click **"Deploy"** — first deploy takes 2-5 minutes while it installs
-   `requirements.txt`
-
-**Step 4 — Share it**
-You'll get a public URL like `https://paisapilot.streamlit.app` — no login
-required for viewers. Use this as your Public Project Link in the Kaggle
-Writeup. Any future `git push` to `main` redeploys automatically.
-
 ## Tech stack
 
 - **Agent brain:** Gemini (Google Gen AI SDK, free-tier function calling)
