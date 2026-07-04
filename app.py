@@ -444,12 +444,27 @@ st.markdown(
 
 with st.sidebar:
     st.markdown("<div class='ledger-heading'>Teller Setup</div>", unsafe_allow_html=True)
-    api_key = st.text_input("Gemini API key", type="password",
-                             value=os.environ.get("GEMINI_API_KEY", ""))
-    st.caption(
-        "Free — no credit card. Get one at "
-        "[aistudio.google.com/apikey](https://aistudio.google.com/apikey)."
+
+    # The app owner's key (set via Streamlit Cloud "Secrets", never shown to
+    # the browser) powers the demo by default. The sidebar field is only for
+    # a visitor who wants to use their own key instead — it is intentionally
+    # left blank, never pre-filled with a secret, so the secret is never sent
+    # to the client.
+    server_key = st.secrets.get("GEMINI_API_KEY", os.environ.get("GEMINI_API_KEY", ""))
+    user_key = st.text_input(
+        "Gemini API key (optional — leave blank to use the demo's key)",
+        type="password",
+        value="",
     )
+    api_key = user_key or server_key
+
+    if server_key and not user_key:
+        st.caption("✓ Using the demo's built-in key.")
+    else:
+        st.caption(
+            "Free — no credit card. Get your own key at "
+            "[aistudio.google.com/apikey](https://aistudio.google.com/apikey)."
+        )
     st.markdown("<div class='ledger-heading'>Data Source</div>", unsafe_allow_html=True)
     data_source = st.radio("Data source", ["Use demo data", "Upload my UPI CSV"], label_visibility="collapsed")
     uploaded = None
